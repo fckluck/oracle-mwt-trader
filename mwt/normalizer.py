@@ -1,170 +1,125 @@
 """
-MWT Normalization - Convert venue-specific events to universal MWT objects
+MWT Normalizer
+
+Converts raw platform data into normalized MWTTrade objects.
 """
 
+from mwt.models import MWTTrade, Asset, Side, Platform, WalletClass
+from datetime import datetime
+from typing import Dict, Any
 import logging
-from typing import Optional
-from datetime import datetime, timedelta
-import uuid
-
-from backend.models import WalletEvent, MWTObject
-from backend.storage import get_storage
 
 logger = logging.getLogger(__name__)
 
+# Allowed assets for Phase 1
+ALLOWED_ASSETS = {Asset.SOL, Asset.BTC, Asset.ETH, Asset.HYPE}
 
-class MWTNormalizer:
-    """Normalizes wallet events from different venues into MWT objects"""
+
+def normalize_raw_trade(raw: Dict[str, Any], wallet_id: str = None) -> MWTTrade:
+    """Normalize raw trade data into MWTTrade
     
-    def __init__(
-        self,
-        cluster_window_minutes: int = 60,
-        min_cluster_size: int = 2,
-    ):
-        """Initialize normalizer
+    Args:
+        raw: Raw trade data dict
+        wallet_id: Override wallet ID if provided
         
-        Args:
-            cluster_window_minutes: Time window for clustering similar events
-            min_cluster_size: Minimum number of events to form a cluster
-        """
-        self.cluster_window_minutes = cluster_window_minutes
-        self.min_cluster_size = min_cluster_size
-    
-    async def normalize(self, event: WalletEvent) -> Optional[MWTObject]:
-        """Normalize a wallet event into MWT object(s)
+    Returns:
+        Normalized MWTTrade
         
-        Phase 1: Simple clustering by asset and direction within time window
+    Raises:
+        ValueError: If data is invalid
+    """
+    try:
+        # Extract required fields
+        wallet_id = wallet_id or raw.get("wallet_id", "")
+        if not wallet_id:
+            raise ValueError("wallet_id required")
         
-        Args:
-            event: Raw wallet event to normalize
-            
-        Returns:
-            MWT object if sufficient cluster formed, None otherwise
-        """
+        # Asset validation
+        asset_str = raw.get("asset", "").upper()
         try:
-            # Get storage
-            storage = get_storage()
-            
-            # Find recent events with same asset and direction
-            window_start = event.timestamp - timedelta(minutes=self.cluster_window_minutes)
-            
-            recent_events = await storage.get_events(asset=event.asset, limit=1000)
-            
-            # Filter by direction and time window
-            matching_events = [
-                e for e in recent_events
-                if (e.direction == event.direction and
-                    e.timestamp >= window_start and
-                    e.timestamp <= event.timestamp)
-            ]
-            
-            # Add current event if not already included
-            if event not in matching_events:
-                matching_events.append(event)
-            
-            # Check if we have enough events to form a cluster
-            if len(matching_events) < self.min_cluster_size:
-                logger.debug(
-                    f"📉 Insufficient cluster size for {event.asset} "
-                    f"{event.direction}: {len(matching_events)}/{self.min_cluster_size}"
-                )
-                return None
-            
-            # Create MWT object
-            mwt = self._create_mwt_object(event.asset, event.direction, matching_events)
-            
-            logger.info(
-                f"✅ Created MWT: {event.asset} {event.direction} "
-                f"({len(set(e.wallet_address for e in matching_events))} wallets, "
-                f"conviction: {mwt.conviction_score:.2f})"
-            )
-            
-            return mwt
-            
-        except Exception as e:
-            logger.error(f"❌ Normalization failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def _create_mwt_object(
-        self,
-        asset: str,
-        direction: str,
-        events: list,
-    ) -> MWTObject:
-        """Create an MWT object from clustered events
+            asset = Asset[asset_str]
+        except KeyError:
+            raise ValueError(f"Asset {asset_str} not supported. Allowed: {list(ALLOWED_ASSETS)}")
         
-        Args:
-            asset: Asset being traded
-            direction: Trade direction (long/short)
-            events: List of clustered events
-            
-        Returns:
-            MWT object with computed metrics
-        """
-        # Remove duplicates by wallet
-        unique_wallets = {}
-        for event in events:
-            if event.wallet_address not in unique_wallets:
-                unique_wallets[event.wallet_address] = event
+        if asset not in ALLOWED_ASSETS:
+            raise ValueError(f"Asset {asset} not in Phase 1 active assets")
         
-        unique_events = list(unique_wallets.values())
-        wallet_count = len(unique_events)
+        # Side validation
+        side_str = raw.get("side", "").lower()
+        if side_str not in ["long", "short"]:
+            raise ValueError(f"Side must be 'long' or 'short', got {side_str}")
+        side = Side.LONG if side_str == "long" else Side.SHORT
         
-        # Compute metrics
-        avg_size = sum(e.size for e in unique_events) / wallet_count if wallet_count > 0 else 0
+        # Leverage validation
+        leverage = float(raw.get("leverage", 1.0))
+        if leverage <= 0 or leverage > 200:
+            raise ValueError(f"Leverage must be > 0 and <= 200, got {leverage}")
         
-        # Compute venue distribution
-        venue_distribution = {}
-        for event in unique_events:
-            venue = event.venue
-            venue_distribution[venue] = venue_distribution.get(venue, 0) + 1
+        # Size validation
+        size_usd = float(raw.get("size_usd", 0))
+        if size_usd <= 0:
+            raise ValueError(f"Size must be > 0, got {size_usd}")
         
-        # Compute conviction score (Phase 1 simple model)
-        conviction_score = self._compute_conviction_score(wallet_count, avg_size)
+        # Price validation
+        entry_price = float(raw.get("entry_price", 0))
+        if entry_price <= 0:
+            raise ValueError(f"Entry price must be > 0, got {entry_price}")
         
-        # Compute temporal bounds
-        timestamps = [e.timestamp for e in unique_events]
-        cluster_start = min(timestamps)
-        cluster_end = max(timestamps)
+        # Platform normalization
+        platform_str = raw.get("platform", "unknown").lower()
+        try:
+            platform = Platform[platform_str.upper()]
+        except KeyError:
+            platform = Platform.UNKNOWN
         
-        # Create MWT object
-        mwt = MWTObject(
-            mwt_id=str(uuid.uuid4()),
+        # Timestamp
+        timestamp_str = raw.get("timestamp")
+        if isinstance(timestamp_str, str):
+            timestamp = datetime.fromisoformat(timestamp_str)
+        elif isinstance(timestamp_str, datetime):
+            timestamp = timestamp_str
+        else:
+            timestamp = datetime.utcnow()
+        
+        # Create trade
+        trade = MWTTrade(
+            wallet_id=wallet_id,
+            wallet_class=WalletClass(raw.get("wallet_class", "unknown")),
             asset=asset,
-            direction=direction,
-            conviction_score=conviction_score,
-            wallet_count=wallet_count,
-            avg_size=avg_size,
-            venue_distribution=venue_distribution,
-            cluster_start=cluster_start,
-            cluster_end=cluster_end,
-            event_count=len(unique_events),
+            side=side,
+            leverage=leverage,
+            size_usd=size_usd,
+            entry_price=entry_price,
+            platform=platform,
+            timestamp=timestamp,
+            raw=raw,
         )
         
-        return mwt
+        logger.info(f"✅ Normalized {asset} {side} trade from {wallet_id}")
+        return trade
+        
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error(f"❌ Normalization failed: {e}")
+        raise ValueError(f"Invalid trade data: {str(e)}")
+
+
+def validate_asset(asset_str: str) -> Asset:
+    """Validate asset string
     
-    def _compute_conviction_score(self, wallet_count: int, avg_size: float) -> float:
-        """Compute conviction score
+    Args:
+        asset_str: Asset string
         
-        Phase 1: Simple model based on wallet count and size
+    Returns:
+        Asset enum value
         
-        Args:
-            wallet_count: Number of unique wallets in cluster
-            avg_size: Average position size
-            
-        Returns:
-            Conviction score (0.0 to 1.0)
-        """
-        # Normalize by typical parameters
-        max_wallets = 50
-        max_size = 100.0
-        
-        wallet_factor = min(wallet_count / max_wallets, 1.0)
-        size_factor = min(avg_size / max_size, 1.0)
-        
-        # Weighted average
-        conviction_score = (wallet_factor * 0.6) + (size_factor * 0.4)
-        
-        return min(conviction_score, 1.0)
+    Raises:
+        ValueError: If asset not supported
+    """
+    asset_upper = asset_str.upper()
+    try:
+        asset = Asset[asset_upper]
+        if asset not in ALLOWED_ASSETS:
+            raise ValueError(f"Asset {asset} not in Phase 1 active set")
+        return asset
+    except KeyError:
+        raise ValueError(f"Unsupported asset {asset_str}")

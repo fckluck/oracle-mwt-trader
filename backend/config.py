@@ -1,51 +1,48 @@
 """
-Configuration management for Oracle MWT Trader
+Backend Configuration
+
+Settings from environment or .env file.
 """
 
 from pydantic_settings import BaseSettings
 from typing import List
-from enum import Enum
-
-
-class StorageType(str, Enum):
-    """Storage backend types"""
-    MEMORY = "memory"
-    SQLITE = "sqlite"
 
 
 class Settings(BaseSettings):
-    """Application settings from environment"""
+    """Application settings"""
+    
+    # Application
+    app_name: str = "Oracle MWT Trader"
+    phase: str = "observe_only"
+    live_execution: bool = False
     
     # Server
-    server_host: str = "0.0.0.0"
+    server_host: str = "127.0.0.1"
     server_port: int = 8000
     log_level: str = "INFO"
     
-    # Storage
-    storage_type: StorageType = StorageType.MEMORY
-    database_url: str = "sqlite:///./oracle_mwt.db"
+    # Database
+    database_url: str = "sqlite:///oracle_mwt.db"
     
-    # Conviction Engine
-    conviction_window_minutes: int = 60
+    # Conviction
+    conviction_threshold: float = 0.75
+    window_minutes: int = 15
     min_cluster_size: int = 2
-    conviction_threshold: float = 0.65
     
-    # Assets (Phase 1)
-    active_assets: List[str] = ["SOL", "BTC", "ETH", "HYPE"]
+    # Paper Trading
+    starting_balance: float = 100000.0
+    daily_profit_cap: float = 10000.0
     
-    # Mock Data
-    use_mock_data: bool = True
-    mock_events_per_minute: int = 5
-    
-    # API Config
-    api_version: str = "v1"
-    enable_docs: bool = True
+    # Assets (Phase 1 only)
+    active_assets: str = "SOL,BTC,ETH,HYPE"
     
     class Config:
-        """Pydantic config"""
         env_file = ".env"
         case_sensitive = False
+    
+    def get_active_assets(self) -> List[str]:
+        """Parse active assets"""
+        return [a.strip().upper() for a in self.active_assets.split(",")]
 
 
-# Global settings instance
 settings = Settings()
