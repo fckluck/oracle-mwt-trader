@@ -26,6 +26,7 @@ Oracle MWT Trader tracks smart money across perp platforms by:
 ✅ Universal MWT object normalization  
 ✅ Conviction cluster computation  
 ✅ API endpoints for visibility  
+✅ Paper trading simulation  
 ❌ Live trading execution  
 ❌ Real API keys or wallet credentials  
 
@@ -33,12 +34,57 @@ Oracle MWT Trader tracks smart money across perp platforms by:
 
 ```
 oracle-mwt-trader/
-├── backend/          # FastAPI server, config, models
-├── mwt/              # Multi-Wallet Tracking normalization
-├── conviction/       # Conviction engine
-├── docs/             # System specifications and planning
-└── requirements.txt  # Python dependencies
+├── backend/              # FastAPI server, config, routes
+├── mwt/                  # Multi-Wallet Tracking models + normalization
+├── conviction/           # Conviction scoring and clustering engine
+├── market/               # Bias, structure, liquidation placeholders
+├── storage/              # SQLite schema and DB helpers
+├── paper/                # Paper portfolio + paper simulation
+├── scripts/              # Smoke tests / local runners
+├── tests/                # Pytest suite
+├── docs/                 # System specs and planning
+└── requirements.txt      # Python dependencies
 ```
+
+### Module Breakdown
+
+**backend/**
+- `main.py` - FastAPI app initialization
+- `config.py` - Environment-based settings
+- `routes/` - API endpoints (health, demo, signals)
+
+**mwt/**
+- `models.py` - Pydantic models (MWTTrade, ConvictionSignal, WalletProfile)
+- `normalizer.py` - Trade validation and normalization
+- `listeners/` - Platform listener stubs (Hyperliquid, Jupiter, Ostium)
+
+**conviction/**
+- `engine.py` - Signal clustering and generation
+- `scoring.py` - Conviction score calculations
+
+**market/**
+- `bias.py` - Market directional bias (stub)
+- `structure.py` - Technical structure analysis (stub)
+- `liquidations.py` - Liquidation cluster detection (stub)
+
+**storage/**
+- `db.py` - SQLite database wrapper
+- `schema.sql` - Database schema
+
+**paper/**
+- `portfolio.py` - Paper portfolio management
+- `simulator.py` - Paper trade execution from signals
+
+**scripts/**
+- `smoke_test.py` - End-to-end functionality test
+
+**tests/**
+- `test_normalizer.py` - Normalizer validation tests
+- `test_conviction.py` - Conviction engine tests
+- `test_paper.py` - Paper trading tests
+
+**docs/**
+- `MWT_SYSTEM_SPEC.md` - Complete architecture and design
 
 ## Getting Started
 
@@ -67,161 +113,80 @@ cp .env.example .env
 ### Running the Server
 
 ```bash
-uvicorn backend.main:app --reload
+python -m backend.main
 ```
 
 The API will be available at `http://localhost:8000`
 
-## Phase 1.5 Hardened API Endpoints
+### API Endpoints
 
-### Health & Status
+#### Health & Status
+```bash
+GET /health          # System status
+```
+
+#### Demo & Signals
+```bash
+GET /demo/signal     # Generate demo SOL LONG conviction signal
+GET /signals/        # List current signals
+POST /signals/demo-paper  # Trade demo signal with paper simulator
+```
+
+## Testing
+
+### Smoke Test
 
 ```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/assets
+python scripts/smoke_test.py
 ```
 
-### Database Management
+Tests:
+- Trade normalization
+- Conviction signal generation
+- Paper portfolio operations
+
+### Unit Tests
 
 ```bash
-# Seed with mock data
-curl -X POST http://127.0.0.1:8000/seed
-
-# Clear all data
-curl -X DELETE http://127.0.0.1:8000/events
+pytest tests/
 ```
 
-### Event Ingestion
+Coverage:
+- Normalizer validation and asset filtering
+- Conviction scoring and clustering
+- Paper trading portfolio management
 
-```bash
-# Primary endpoint (alias)
-curl -X POST http://127.0.0.1:8000/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "venue": "drift",
-    "wallet_address": "0x123...",
-    "asset": "SOL",
-    "direction": "long",
-    "size": 10.5,
-    "entry_price": 140.50,
-    "timestamp": "2026-05-28T15:30:00Z",
-    "tx_hash": "0xdef456..."
-  }'
+## Configuration
 
-# Legacy endpoint (still supported)
-curl -X POST http://127.0.0.1:8000/events/ingest \
-  -H "Content-Type: application/json" \
-  -d '{...}'
+Copy `.env.example` to `.env` and configure:
 
-# Retrieve events
-curl http://127.0.0.1:8000/events
-curl http://127.0.0.1:8000/events?asset=SOL&limit=50
+```env
+# Application
+APP_NAME=Oracle MWT Trader
+PHASE=observe_only
+LIVE_EXECUTION=false
+
+# Server
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8000
+LOG_LEVEL=INFO
+
+# Conviction Engine
+CONVICTION_THRESHOLD=0.75
+WINDOW_MINUTES=15
+MIN_CLUSTER_SIZE=2
+
+# Paper Trading
+STARTING_BALANCE=100000
+DAILY_PROFIT_CAP=10000
+
+# Active Assets (Phase 1 only)
+ACTIVE_ASSETS=SOL,BTC,ETH,HYPE
 ```
-
-### MWT & Conviction
-
-```bash
-# Get all MWT objects
-curl http://127.0.0.1:8000/mwt
-
-# Get strongest conviction signal
-curl http://127.0.0.1:8000/conviction
-
-# Get all conviction candidates above threshold
-curl http://127.0.0.1:8000/conviction/all
-
-# Get selected asset with signal status
-curl http://127.0.0.1:8000/selected-asset
-```
-
-## API Response Examples
-
-### POST /events
-```json
-{
-  "event_id": "evt-123",
-  "mwt_id": "mwt-456",
-  "conviction_score": 0.78,
-  "timestamp": "2026-05-28T15:30:00Z",
-  "status": "ingested"
-}
-```
-
-### DELETE /events
-```json
-{
-  "status": "cleared",
-  "timestamp": "2026-05-28T15:30:00Z"
-}
-```
-
-### GET /mwt
-```json
-{
-  "mwt_objects": [
-    {
-      "mwt_id": "mwt-123",
-      "asset": "SOL",
-      "direction": "long",
-      "conviction_score": 0.78,
-      "wallet_count": 8,
-      "avg_size": 12.3,
-      "cluster_start": "2026-05-28T15:20:00Z",
-      "cluster_end": "2026-05-28T15:35:00Z",
-      "event_count": 8
-    }
-  ],
-  "count": 1
-}
-```
-
-### GET /conviction/all
-```json
-{
-  "candidates": [
-    {
-      "mwt_id": "mwt-123",
-      "asset": "SOL",
-      "direction": "long",
-      "conviction_score": 0.78,
-      "wallet_count": 8,
-      "event_count": 8
-    }
-  ],
-  "count": 1,
-  "threshold": 0.65,
-  "window_minutes": 60,
-  "timestamp": "2026-05-28T15:30:00Z"
-}
-```
-
-### GET /selected-asset
-```json
-{
-  "selected": true,
-  "selected_asset": "SOL",
-  "conviction": {
-    "asset": "SOL",
-    "direction": "long",
-    "conviction_score": 0.78,
-    "wallet_count": 15,
-    "confidence": 0.82,
-    "cluster_count": 2,
-    "supporting_events": 16,
-    "timestamp": "2026-05-28T15:30:00Z"
-  },
-  "timestamp": "2026-05-28T15:30:00Z"
-}
-```
-
-## Documentation
-
-- [System Specification](docs/SYSTEM_SPEC.md) - Architecture and design
-- [Phase 1 Build Plan](docs/PHASE_1_BUILD_PLAN.md) - Development roadmap
 
 ## Development
 
-This project is in **Phase 1.5** (visibility & hardening). Live trading execution is planned for future phases.
+This project is in **Phase 1** (visibility & normalization). Live trading execution is planned for future phases.
 
 ### Key Constraints
 
@@ -230,39 +195,59 @@ This project is in **Phase 1.5** (visibility & hardening). Live trading executio
 - ✋ No wallet private keys or seeds
 - ✋ No exchange secrets or funded credentials
 - ✅ Mock data for development and testing
+- ✅ Paper trading simulation for backtesting
 
-### Testing with cURL
+### Example Workflow
 
-```bash
-# Full workflow
-uvicorn backend.main:app --reload &
+1. **Ingest Mock Trades**
+   ```python
+   from mwt.normalizer import normalize_raw_trade
+   
+   raw = {
+       "wallet_id": "whale_1",
+       "asset": "SOL",
+       "side": "long",
+       "leverage": 20.0,
+       "size_usd": 100000,
+       "entry_price": 100.0,
+       "platform": "ostium"
+   }
+   
+   trade = normalize_raw_trade(raw)
+   ```
 
-# Seed database
-curl -X POST http://127.0.0.1:8000/seed
+2. **Build Conviction Signals**
+   ```python
+   from conviction.engine import ConvictionEngine
+   
+   engine = ConvictionEngine(min_score=0.75)
+   engine.add_trade(trade)
+   signals = engine.build_signals()
+   ```
 
-# Check events
-curl http://127.0.0.1:8000/events | jq
+3. **Simulate Paper Trade**
+   ```python
+   from paper.simulator import PaperSimulator
+   
+   simulator = PaperSimulator()
+   result = simulator.trade_signal(signals[0])
+   ```
 
-# Get conviction
-curl http://127.0.0.1:8000/conviction | jq
+## Documentation
 
-# Get candidates
-curl http://127.0.0.1:8000/conviction/all | jq
+- [System Specification](docs/MWT_SYSTEM_SPEC.md) - Architecture, models, and design decisions
 
-# Get selected asset
-curl http://127.0.0.1:8000/selected-asset | jq
+## Contributing
 
-# Clear all
-curl -X DELETE http://127.0.0.1:8000/events
-
-# Verify clear
-curl http://127.0.0.1:8000/events | jq
-```
+- Keep Phase 1 observation-only and paper-trading only
+- Add tests for new features
+- Update documentation when adding modules
+- No real credentials or keys in code
 
 ## License
 
 Proprietary - Oracle MWT Trader
 
-## Contributing
+## Contact
 
-See [PHASE_1_BUILD_PLAN.md](docs/PHASE_1_BUILD_PLAN.md) for development guidelines.
+For questions or contributions, open an issue.
