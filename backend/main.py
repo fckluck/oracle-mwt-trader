@@ -16,11 +16,13 @@ from backend.models import (
     ConvictionSignal,
     IngestEventRequest,
     IngestEventResponse,
+    WalletEvent,
 )
 from backend.storage import get_storage
 from backend.seed import seed_database
 from mwt.normalizer import MWTNormalizer
 from conviction.engine import ConvictionEngine
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +89,64 @@ app.add_middleware(
 
 
 # ============================================================================
+# Shared Helpers
+# ============================================================================
+
+async def _ingest_event(request: IngestEventRequest) -> IngestEventResponse:
+    """Shared event ingestion logic
+    
+    Args:
+        request: IngestEventRequest with wallet event data
+        
+    Returns:
+        IngestEventResponse with event and MWT details
+    """
+    storage = get_storage()
+    
+    # Create WalletEvent
+    event = WalletEvent(
+        event_id=str(uuid.uuid4()),
+        venue=request.venue,
+        wallet_address=request.wallet_address,
+        asset=request.asset,
+        direction=request.direction,
+        size=request.size,
+        entry_price=request.entry_price,
+        timestamp=request.timestamp,
+        tx_hash=request.tx_hash,
+        metadata=request.metadata or {},
+    )
+    
+    # Store event
+    event_id = await storage.store_event(event)
+    
+    # Normalize to MWT
+    mwt_id = None
+    conviction_score = None
+    try:
+        mwt_object = await normalizer.normalize(event)
+        if mwt_object:
+            mwt_id = await storage.store_mwt_object(mwt_object)
+            conviction_score = mwt_object.conviction_score
+            
+            logger.info(
+                f"📊 Created MWT object {mwt_id} with conviction {conviction_score:.2f}"
+            )
+    except Exception as e:
+        logger.error(f"❌ Normalization error: {e}")
+    
+    logger.info(f"✅ Ingested event {event_id} from {request.wallet_address}")
+    
+    return IngestEventResponse(
+        event_id=event_id,
+        mwt_id=mwt_id,
+        conviction_score=conviction_score,
+        timestamp=datetime.utcnow(),
+        status="ingested",
+    )
+
+
+# ============================================================================
 # Health & Status Endpoints
 # ============================================================================
 
@@ -135,53 +195,14 @@ async def seed():
 
 @app.post("/events/ingest", response_model=IngestEventResponse)
 async def ingest_event(request: IngestEventRequest):
+    """Ingest a wallet event (legacy endpoint)"""
+    return await _ingest_event(request)
+
+
+@app.post("/events", response_model=IngestEventResponse)
+async def ingest_event_alias(request: IngestEventRequest):
     """Ingest a wallet event"""
-    storage = get_storage()
-    
-    # Create WalletEvent
-    from backend.models import WalletEvent
-    import uuid
-    
-    event = WalletEvent(
-        event_id=str(uuid.uuid4()),
-        venue=request.venue,
-        wallet_address=request.wallet_address,
-        asset=request.asset,
-        direction=request.direction,
-        size=request.size,
-        entry_price=request.entry_price,
-        timestamp=request.timestamp,
-        tx_hash=request.tx_hash,
-        metadata=request.metadata or {},
-    )
-    
-    # Store event
-    event_id = await storage.store_event(event)
-    
-    # Normalize to MWT
-    mwt_id = None
-    conviction_score = None
-    try:
-        mwt_object = await normalizer.normalize(event)
-        if mwt_object:
-            mwt_id = await storage.store_mwt_object(mwt_object)
-            conviction_score = mwt_object.conviction_score
-            
-            logger.info(
-                f"📊 Created MWT object {mwt_id} with conviction {conviction_score:.2f}"
-            )
-    except Exception as e:
-        logger.error(f"❌ Normalization error: {e}")
-    
-    logger.info(f"✅ Ingested event {event_id} from {request.wallet_address}")
-    
-    return IngestEventResponse(
-        event_id=event_id,
-        mwt_id=mwt_id,
-        conviction_score=conviction_score,
-        timestamp=datetime.utcnow(),
-        status="ingested",
-    )
+    return await _ingest_event(request)
 
 
 @app.get("/events")
@@ -202,13 +223,43 @@ async def get_events(
     }
 
 
+@app.delete("/events")
+async def delete_events():
+    """Clear all events, MWT objects, and wallets from storage"""
+    storage = get_storage()
+    await storage.clear()
+    
+    logger.info("🗑️  Cleared all events, MWT objects, and wallets")
+    
+    return {
+        "status": "cleared",
+        "timestamp": datetime.utcnow(),
+    }
+
+
+# ============================================================================
+# MWT Endpoints
+# ============================================================================
+
+@app.get("/mwt")
+async def get_mwt_objects():
+    """Get all stored MWT objects"""
+    storage = get_storage()
+    mwt_objects = await storage.get_mwt_objects(asset=None, limit=500)
+    
+    return {
+        "mwt_objects": mwt_objects,
+        "count": len(mwt_objects),
+    }
+
+
 # ============================================================================
 # Conviction Endpoints
 # ============================================================================
 
 @app.get("/conviction")
 async def get_conviction():
-    """Get current conviction state (all assets)"""
+    """Get current conviction state (strongest signal)"""
     if not conviction_engine:
         raise HTTPException(status_code=503, detail="Conviction engine not initialized")
     
@@ -227,6 +278,53 @@ async def get_conviction():
     }
 
 
+@app.get("/conviction/all")
+async def get_all_conviction_candidates():
+    """Get all active conviction candidates above threshold
+    
+    Returns all MWT objects meeting conviction criteria, sorted by conviction score
+    """
+    if not conviction_engine:
+        raise HTTPException(status_code=503, detail="Conviction engine not initialized")
+    
+    storage = get_storage()
+    
+    # Get recent MWT objects
+    mwt_objects = await storage.get_mwt_objects(asset=None, limit=500)
+    
+    if not mwt_objects:
+        return {
+            "candidates": [],
+            "count": 0,
+            "threshold": conviction_engine.threshold,
+            "window_minutes": conviction_engine.window_minutes,
+            "timestamp": datetime.utcnow(),
+        }
+    
+    # Filter by conviction threshold and cluster size
+    from datetime import timedelta
+    window_start = datetime.utcnow() - timedelta(minutes=conviction_engine.window_minutes)
+    
+    candidates = [\n        m for m in mwt_objects
+        if (m.cluster_end >= window_start and
+            m.conviction_score >= conviction_engine.threshold and
+            m.wallet_count >= conviction_engine.min_cluster_size)
+    ]
+    
+    # Sort by conviction score descending
+    candidates.sort(key=lambda m: m.conviction_score, reverse=True)
+    
+    logger.info(f"📊 Found {len(candidates)} conviction candidates above threshold {conviction_engine.threshold:.2f}")
+    
+    return {
+        "candidates": candidates,
+        "count": len(candidates),
+        "threshold": conviction_engine.threshold,
+        "window_minutes": conviction_engine.window_minutes,
+        "timestamp": datetime.utcnow(),
+    }
+
+
 @app.get("/selected-asset")
 async def selected_asset():
     """Get highest conviction asset"""
@@ -237,13 +335,15 @@ async def selected_asset():
     
     if not conviction:
         return {
+            "selected": False,
             "selected_asset": None,
             "conviction": None,
-            "message": "No conviction signals detected",
+            "message": "No conviction signal above threshold",
             "timestamp": datetime.utcnow(),
         }
     
     return {
+        "selected": True,
         "selected_asset": conviction["asset"],
         "conviction": conviction,
         "timestamp": datetime.utcnow(),
@@ -264,10 +364,16 @@ async def root():
         "docs": "/docs" if settings.enable_docs else None,
         "health": "/health",
         "endpoints": {
+            "health": "GET /health",
+            "assets": "GET /assets",
             "seed": "POST /seed",
             "ingest": "POST /events/ingest",
-            "events": "GET /events",
+            "ingest_alias": "POST /events",
+            "get_events": "GET /events",
+            "delete_events": "DELETE /events",
+            "mwt": "GET /mwt",
             "conviction": "GET /conviction",
+            "conviction_all": "GET /conviction/all",
             "selected_asset": "GET /selected-asset",
         },
     }
